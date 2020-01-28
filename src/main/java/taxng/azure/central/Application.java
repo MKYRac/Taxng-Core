@@ -10,10 +10,16 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 import com.microsoft.azure.storage.CloudStorageAccount;
+import com.microsoft.azure.storage.file.CloudFile;
+import com.microsoft.azure.storage.file.CloudFileClient;
+import com.microsoft.azure.storage.file.CloudFileDirectory;
+import com.microsoft.azure.storage.file.CloudFileShare;
+import com.microsoft.azure.storage.file.ListFileItem;
 import com.microsoft.azure.storage.queue.CloudQueue;
 import com.microsoft.azure.storage.queue.CloudQueueClient;
 import com.microsoft.azure.storage.queue.CloudQueueMessage;
 
+import taxng.azure.central.service.ApplicationController;
 import taxng.azure.central.service.DatabaseService;
 import taxng.azure.central.service.FileHandler;
 import taxng.azure.central.service.TaxMessageService;
@@ -46,7 +52,7 @@ public class Application implements ApplicationRunner {
 	private TaxMessageService tmsgService;
 	
 	@Autowired
-	private DatabaseService dbService;
+	private ApplicationController appController;
 	
 	private static final Logger log = LoggerFactory.getLogger(Application.class);
 
@@ -67,12 +73,25 @@ public class Application implements ApplicationRunner {
 			    "AccountName=" + accountName + ";" +
 			    "AccountKey=" + accountKey;
 		
+		String inputMsgStr = "";
+		
 		while(true) {
 			
 			try {
 				
 				// Get storage account details and store them in CloudStorageAccount object
 				CloudStorageAccount storageAccount = CloudStorageAccount.parse(storageConnectionString);
+				
+				CloudFileClient fileClient = storageAccount.createCloudFileClient();
+				CloudFileShare share = fileClient.getShareReference("taxngfileshare");
+				CloudFileDirectory rootDir = share.getRootDirectoryReference();
+
+				for ( ListFileItem fileItem : rootDir.listFilesAndDirectories() ) {
+				    CloudFile file = (CloudFile) fileItem;
+				    inputMsgStr = file.downloadText();
+				    appController.execute(inputMsgStr, 1);
+				    file.delete();
+				}
 				
 				// Create CloudQueuClient object
 				CloudQueueClient queueClient = storageAccount.createCloudQueueClient();
@@ -83,7 +102,7 @@ public class Application implements ApplicationRunner {
 				// Get current number of messages waiting in queue to get processed
 				inputQueue.downloadAttributes();
 				long msgCount = inputQueue.getApproximateMessageCount();
-				
+			
 				/*
 				 *  If message(s) is/are available execute following code
 				 *  If no messages available, pause thread for 30 seconds and try again 
@@ -91,83 +110,26 @@ public class Application implements ApplicationRunner {
 				 */
 				
 				if(msgCount > 0) {
-					
-					log.info("<<< LOGGING STARTS HERE >>>");
-					
+
 					// Get message from queue front
 					CloudQueueMessage inputMsg = inputQueue.retrieveMessage();
 					
 					// Store message content in string variable
-					String inputMsgStr = inputMsg.getMessageContentAsString();
+					inputMsgStr = inputMsg.getMessageContentAsString();
 					
-					log.info("Received Message: -- " + inputMsgStr);
-					log.info("<<< Message gets processed >>>");
+					appController.execute(inputMsgStr, 2);
 					
-					/*
-					 *  Check if "<xml>"-tags are in message
-					 *  If yes continue processing message
-					 *  If no log error and put message into error queue
-					 *  (see else on line 142)
-					 */
-					if(fileHandler.isXMLFormat(inputMsgStr)) {
-						
-						// Extract information from xml message string variable
-						int txId = Integer.parseInt(fileHandler.getDataFromXMLFormat(inputMsgStr, "txId"));
-						double bPrice = Double.parseDouble(fileHandler.getDataFromXMLFormat(inputMsgStr, "bPrice"));
-						double sPrice = Double.parseDouble(fileHandler.getDataFromXMLFormat(inputMsgStr, "sPrice"));
-						int nos = Integer.parseInt(fileHandler.getDataFromXMLFormat(inputMsgStr, "nos"));
-						double taxRate = Double.parseDouble(fileHandler.getDataFromXMLFormat(inputMsgStr, "taxRate"));
-						
-						// Call tax message service implementation and calculate tax amount
-						double result = tmsgService.taxAmount(bPrice, sPrice, nos, taxRate);
-						
-						log.info("Message processed -- Tax amount is: " + String.valueOf(result));
-						
-						// Call database service to store values in database
-						dbService.saveDataToDB(txId, bPrice, sPrice, nos, taxRate, result);
-						
-						// Compose result string variable (initial XML message with added tax amount)
-						String strResult = fileHandler.generateXMLFormat(inputMsgStr, result);
-						
-						// Get output queue and store it in CloudQueue object
-						CloudQueue outputQueue = queueClient.getQueueReference(outputQueueName);
-						
-						// Create output message as CloudQueueMessage object
-						CloudQueueMessage outputMsg = new CloudQueueMessage(strResult);
-						
-						// Add output message to output queue
-						outputQueue.addMessage(outputMsg);
-						
-						log.info("<<< Processed Message >>> " + outputMsg.getMessageContentAsString());
-						log.info("Message processed to queue " + outputQueueName);
-					
-					} else {
-						
-						log.info("Message is not in XML format.");
-						log.info("Message processed to queue " + errorQueueName);
-						
-						// Get error queue and store it in CloudQueue object
-						CloudQueue errorQueue = queueClient.getQueueReference(errorQueueName);
-						
-						// Create error message as CloudQueueMessage object
-						CloudQueueMessage errorMsg = new CloudQueueMessage(inputMsgStr);
-						
-						// Add error message to error queue
-						errorQueue.addMessage(errorMsg);
-					}
-					
-					// Remove initial message from input queue
 					inputQueue.deleteMessage(inputMsg);
-					
-					log.info("<<< LOGGING ENDS HERE >>>");
 				
-				} else {
+				}
+				
+				else {
 					
 					log.info("No messages currently available.");
 					Thread.sleep(30000);
 				
 				}
-				
+					
 			} catch (Exception e) {
 				log.error(e.toString());
 			}
